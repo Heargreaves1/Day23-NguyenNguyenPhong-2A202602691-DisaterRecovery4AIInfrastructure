@@ -31,9 +31,36 @@ import os
 import pathlib
 import signal
 import subprocess
+import sys
 import time
 
 import httpx
+
+def _suspend_pid(pid: int):
+    if sys.platform == "win32":
+        import ctypes
+        handle = ctypes.windll.kernel32.OpenProcess(0x1F0FFF, False, pid)
+        if handle:
+            ctypes.windll.ntdll.NtSuspendProcess(handle)
+            ctypes.windll.kernel32.CloseHandle(handle)
+    else:
+        os.kill(pid, signal.SIGSTOP)
+
+def _resume_pid(pid: int):
+    if sys.platform == "win32":
+        import ctypes
+        handle = ctypes.windll.kernel32.OpenProcess(0x1F0FFF, False, pid)
+        if handle:
+            ctypes.windll.ntdll.NtResumeProcess(handle)
+            ctypes.windll.kernel32.CloseHandle(handle)
+    else:
+        os.kill(pid, signal.SIGCONT)
+
+def _kill_pid(pid: int):
+    if sys.platform == "win32":
+        os.kill(pid, signal.SIGTERM)
+    else:
+        os.kill(pid, signal.SIGKILL)
 
 EVENTS = pathlib.Path("chaos/chaos-events.jsonl")
 PID_DIR = pathlib.Path("run")
@@ -67,7 +94,17 @@ def pid_of(region: str) -> int | None:
     f = PID_DIR / f"region-{region}.pid"
     if not f.exists():
         return None
-    pid = int(f.read_text().strip())
+    try:
+        pid = int(f.read_text().strip())
+    except ValueError:
+        return None
+    if sys.platform == "win32":
+        import ctypes
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return pid
+        return None
     try:
         os.kill(pid, 0)
         return pid
@@ -96,7 +133,10 @@ def kill(region: str, mode: str, backend: str, force_both: bool, mock: bool):
         # netblock: SIGSTOP -> TCP handshake vẫn xong nhưng không ai trả lời => request TREO
         #           (đúng hành vi của iptables DROP ở tầng app)
         # stop    : SIGKILL -> cổng đóng => ConnectError ngay
-        os.kill(pid, signal.SIGSTOP if mode == "netblock" else signal.SIGKILL)
+        if mode == "netblock":
+            _suspend_pid(pid)
+        else:
+            _kill_pid(pid)
     else:
         svc = f"serving-{region}"
         if mode == "stop":
@@ -111,7 +151,7 @@ def restore(region: str, backend: str):
     if backend == "bare":
         pid = pid_of(region)
         if pid:
-            os.kill(pid, signal.SIGCONT)
+            _resume_pid(pid)
             return event(action="restore", region=region, method="SIGCONT", pid=pid)
         return event(action="restore", region=region, method="need_manual_start",
                      note="process da bi SIGKILL, chay `make up-bare` lai")

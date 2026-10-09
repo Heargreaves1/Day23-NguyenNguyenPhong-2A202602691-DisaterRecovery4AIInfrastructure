@@ -7,6 +7,7 @@ không phải cảm giác của bạn. Không có file này -> không có bằng
 """
 import argparse
 import json
+import os
 import pathlib
 import time
 
@@ -14,7 +15,7 @@ import httpx
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--url", default="http://127.0.0.1:8080/v1/infer")
+    p.add_argument("--url", default=os.environ.get("EDGE_URL", "http://127.0.0.1:8088/v1/infer"))
     p.add_argument("--rps", type=float, default=2.0)
     p.add_argument("--duration", type=float, default=300)
     p.add_argument("--timeout", type=float, default=3.0)

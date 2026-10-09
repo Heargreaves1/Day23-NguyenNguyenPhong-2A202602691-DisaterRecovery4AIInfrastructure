@@ -35,13 +35,122 @@ LOG = pathlib.Path("reports/failover-events.jsonl")
 
 
 def emit(**kw):
-    """TODO: append 1 dòng JSONL có ts + iso vào LOG, và print ra stdout."""
-    raise NotImplementedError
+    """Append 1 dòng JSONL có ts + iso vào LOG, và print ra stdout."""
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    rec = {
+        "ts": time.time(),
+        "iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+        **kw,
+    }
+    with LOG.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec) + "\n")
+        f.flush()
+    print("FAILOVER", json.dumps(rec))
+    return rec
 
 
-def failover(target: str, backend: str, wait: float) -> dict:
-    """TODO: 5 bước ở trên, đúng thứ tự."""
-    raise NotImplementedError
+def state_of(region: str) -> dict:
+    """Kiểm tra state của 1 region."""
+    try:
+        r = httpx.get(f"{URL[region]}/v1/state", timeout=2.0)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    p = pathlib.Path(f"state/region-{region}")
+    ps_file = p / "pool_state"
+    ps = ps_file.read_text().strip() if ps_file.exists() else "unknown"
+    weights = (p / "weights" / "model.bin").exists()
+    db = p / "vectors.sqlite"
+    count = 0
+    latest_ts = None
+    if db.exists():
+        import sqlite3
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            count, latest_ts = con.execute("SELECT COUNT(*), MAX(ingested_at) FROM docs").fetchone()
+        except Exception:
+            pass
+        finally:
+            con.close()
+    return {"region": region, "pool_state": ps, "weights": weights, "count": count or 0, "latest_doc_ts": latest_ts}
+
+
+def failover(target: str, backend: str, wait: float = 60.0) -> dict:
+    """5 bước failover đúng thứ tự: verify -> restore -> scale -> wait -> cutover."""
+    primary = "a" if target == "b" else "b"
+
+    # Bước 1: 1_verify_target
+    initial_target_state = state_of(target)
+    emit(step="1_verify_target", target=target, state=initial_target_state)
+
+    # Bước 2: 2_restore_snapshot
+    meta = snapshot.get(target, backend)
+    prim_db = pathlib.Path(f"state/region-{primary}/vectors.sqlite")
+    rest_db = pathlib.Path(f"state/region-{target}/vectors.sqlite")
+    rpo_info = snapshot.rpo(prim_db, rest_db)
+    rpo_seconds = rpo_info.get("rpo_seconds")
+    docs_lost = rpo_info.get("docs_lost")
+    embed_model_version = meta.get("embed_model_version")
+
+    emit(
+        step="2_restore_snapshot",
+        target=target,
+        backend=backend,
+        rpo_seconds=rpo_seconds,
+        docs_lost=docs_lost,
+        embed_model_version=embed_model_version,
+        snapshot_meta=meta,
+    )
+
+    # Bước 3: 3_scale_pool (warm -> full)
+    pool_file = pathlib.Path(f"state/region-{target}/pool_state")
+    pool_file.parent.mkdir(parents=True, exist_ok=True)
+    pool_file.write_text("full\n")
+    emit(step="3_scale_pool", target=target, pool_state="full")
+
+    # Bước 4: 4_wait_ready (poll /readyz tới khi 200 hoặc hết wait)
+    t_wait_start = time.time()
+    ready = False
+    while time.time() - t_wait_start < wait:
+        try:
+            res = httpx.get(f"{URL[target]}/readyz", timeout=1.0)
+            if res.status_code == 200:
+                ready = True
+                break
+        except Exception:
+            pass
+        time.sleep(0.3)
+
+    waited_s = round(time.time() - t_wait_start, 2)
+    if not ready:
+        emit(step="4_wait_ready", target=target, ready=False, waited_s=waited_s, error="timeout_waiting_for_ready")
+        return {
+            "ok": False,
+            "step": "4_wait_ready",
+            "error": "target_region_not_ready",
+            "waited_s": waited_s,
+            "target": target,
+        }
+
+    emit(step="4_wait_ready", target=target, ready=True, waited_s=waited_s)
+
+    # Bước 5: 5_dns_cutover (chỉ thực hiện khi bước 4 thành công)
+    active_file = pathlib.Path("edge/active_region")
+    active_file.parent.mkdir(parents=True, exist_ok=True)
+    active_file.write_text(f"{target}\n")
+    emit(step="5_dns_cutover", target=target, active_region=target)
+
+    return {
+        "ok": True,
+        "target": target,
+        "backend": backend,
+        "rpo_seconds": rpo_seconds,
+        "docs_lost": docs_lost,
+        "embed_model_version": embed_model_version,
+        "waited_s": waited_s,
+        "target_state": state_of(target),
+    }
 
 
 if __name__ == "__main__":
